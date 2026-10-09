@@ -2,13 +2,15 @@
 
 **Team members:** (names / roll numbers)
 **Course / Institution:** (fill in)
-**Repository:** https://github.com/<your-username>/hospital-mgmt
-**Live URL (Cloud Run):** https://hms-app-xxxxx-el.a.run.app
+**Repository:** https://github.com/honeycake2601/hospital-mgmt
+**Live URL (Render):** https://hms-app.onrender.com  *(replace with your URL)*
+
+> **Platform note:** The guidelines suggest Google Cloud. Because Google Cloud requires a payment card, this project uses an equivalent free stack: GitHub Container Registry (in place of Artifact Registry), Render (in place of Cloud Run) and Render Logs/Metrics + UptimeRobot (in place of Cloud Monitoring/Logging). The DevOps workflow is the same.
 
 ---
 
 ## 1. Introduction / Project Description
-The Hospital Management System (HMS) is a small web application that lets hospital staff register patients, add doctors and book appointments. The project's main purpose is to demonstrate a complete DevOps lifecycle: source control, automated testing, containerization, a CI/CD pipeline, deployment on Google Cloud Run, and monitoring with basic SRE practices.
+The Hospital Management System (HMS) is a small web application for registering patients, adding doctors and booking appointments. The project demonstrates a complete DevOps lifecycle: source control, automated testing, containerization, a CI/CD pipeline, cloud deployment, and monitoring with basic SRE practices.
 
 **Functional features**
 - Register and list patients
@@ -24,9 +26,9 @@ The Hospital Management System (HMS) is a small web application that lets hospit
 | Testing | pytest |
 | Containerization | Docker |
 | CI/CD | GitHub Actions |
-| Registry | Google Artifact Registry |
-| Deployment | Google Cloud Run |
-| Monitoring | Google Cloud Monitoring / Logging |
+| Registry | GitHub Container Registry (GHCR) |
+| Deployment | Render (Docker web service) |
+| Monitoring | Render Logs & Metrics, UptimeRobot |
 
 ## 7. Application Architecture
 ```
@@ -40,166 +42,153 @@ The Hospital Management System (HMS) is a small web application that lets hospit
                                    │ CD: docker build + push   │
                                    └────────────┬─────────────┘
                                                 ▼
-                                   Google Artifact Registry
-                                                │ (image :commit-sha)
-                                                ▼
- User ──HTTPS──▶  Google Cloud Run  (hms-app: Flask + Gunicorn + SQLite)
+                                   GitHub Container Registry (GHCR)
+                                                │ (image :commit-sha, :latest)
+                                   Deploy Hook ──▼
+ User ──HTTPS──▶  Render Web Service  (hms-app: Flask + Gunicorn + SQLite)
                          │
-                         ├──stdout JSON logs──▶ Cloud Logging ──▶ Log-based metric
-                         └──────────────────────▶ Cloud Monitoring (uptime check /health, alerts)
+                         ├── stdout JSON logs ──▶ Render Logs
+                         ├── CPU/memory/HTTP ───▶ Render Metrics
+                         └── GET /health ◀────── Render health check + UptimeRobot (alerts)
 ```
 **Components**
 - **Flask app** – REST API (`/api/patients`, `/api/doctors`, `/api/appointments`, `/api/stats`), web UI at `/`, health endpoint `/health`.
-- **SQLite** – lightweight embedded DB (file in `/tmp`). *Limitation:* Cloud Run is stateless, so data resets when an instance restarts. In production this would be Cloud SQL / Firestore.
+- **SQLite** – embedded database. *Limitation:* the container filesystem is temporary, so data resets on restart/redeploy. A production system would use a managed database.
 - **GitHub Actions** – runs the CI/CD workflow.
-- **Artifact Registry** – stores versioned Docker images.
-- **Cloud Run** – serverless container hosting with HTTPS and autoscaling.
-- **Cloud Logging / Monitoring** – logs, uptime checks, alerts.
+- **GHCR** – stores versioned Docker images.
+- **Render** – hosts the container with HTTPS and automatic restarts.
+- **UptimeRobot** – external monitor that checks `/health` and sends email alerts.
 
-> 📸 *Screenshot: architecture diagram (draw it in draw.io / Lucid and insert here).*
+> 📸 *Screenshot: architecture diagram (draw it in draw.io and insert here).*
 
 ## 8. DevOps Implementation
 
 ### 8.1 Develop
-The application is a single Flask module (`app.py`) with a minimal HTML/JS front end. Key design choices that support DevOps:
-- `create_app()` factory so tests can use an isolated database.
-- `/health` endpoint that actually verifies database access (returns **200** or **503**).
-- Structured JSON logging with a `severity` field so Cloud Logging classifies entries correctly.
-- Configuration through environment variables (`PORT`, `DB_PATH`) – twelve-factor style.
+Single Flask module (`app.py`) with a minimal HTML/JS front end. Design choices that support DevOps:
+- `create_app()` factory so tests use an isolated database.
+- `/health` endpoint that verifies database access (returns **200** or **503**).
+- Structured JSON logs with a `severity` field.
+- Configuration through environment variables (`PORT`, `DB_PATH`).
 
-Run locally:
 ```bash
 pip install -r requirements.txt
 python app.py        # http://localhost:8080
 ```
-> 📸 *Screenshot: app running locally / UI with sample data.*
+> 📸 *Screenshot: app running locally with sample data.*
 
-### 8.2 Git / GitHub
+### 8.2 Git/GitHub
 ```bash
 git init
 git add .
 git commit -m "Initial commit: hospital management app"
 git branch -M main
-git remote add origin https://github.com/<user>/hospital-mgmt.git
+git remote add origin https://github.com/honeycake2601/hospital-mgmt.git
 git push -u origin main
 ```
-Workflow used: feature changes committed with meaningful messages and pushed to `main`; the pipeline runs on every push and pull request.
+Changes are committed with meaningful messages to `main`; the pipeline runs on every push and pull request.
 > 📸 *Screenshot: GitHub repo page and commit history.*
 
 ### 8.3 Build and Testing
-`pytest` runs 7 unit tests covering: health check (healthy and unhealthy DB), patient creation/validation, doctor and appointment flow, referential validation (unknown patient → 404), and stats.
+`pytest` runs 7 unit tests: health check (healthy and unhealthy DB), patient creation/validation, doctor and appointment flow, referential validation (unknown patient → 404), and stats. `pytest.ini` sets the import path so tests run the same locally and in CI.
 ```bash
 pytest -v
 ```
 > 📸 *Screenshot: pytest output showing 7 passed.*
 
 ### 8.4 Docker
-`Dockerfile`: slim Python base image, dependencies installed first (layer caching), runs as a **non-root user**, served by Gunicorn on `$PORT`.
+Slim Python base image, dependencies installed first (layer caching), non-root user, served by Gunicorn on `$PORT`.
 ```bash
 docker build -t hms-app .
 docker run -p 8080:8080 hms-app
 curl localhost:8080/health
 ```
-> 📸 *Screenshot: `docker build`, `docker images`, container running.*
+> 📸 *Screenshot: `docker build`, `docker images`, running container.*
 
-### 8.5 Package / Register (Artifact Registry)
-Created by `scripts/gcp-setup.sh`:
-```bash
-gcloud artifacts repositories create hms-repo --repository-format=docker --location=asia-south1
-```
-The pipeline pushes `…/hms-repo/hms-app:<commit-sha>` and `:latest`. Tagging with the commit SHA gives traceability and easy rollback.
-> 📸 *Screenshot: Artifact Registry showing the image and its tags.*
+### 8.5 Package/Register (GitHub Container Registry)
+The pipeline logs in to `ghcr.io` with the built-in `GITHUB_TOKEN` and pushes `ghcr.io/honeycake2601/hospital-mgmt:<commit-sha>` and `:latest`. SHA tags give traceability and easy rollback. The package is set to **Public** so Render can pull it without credentials.
+> 📸 *Screenshot: repo → Packages → hospital-mgmt showing the tags.*
 
 ### 8.6 Continuous Integration
-File: `.github/workflows/ci-cd.yml`, job **test**: checkout → set up Python 3.12 → install dependencies → run pytest. It runs on every push and pull request; a failing test blocks the deploy job.
-> 📸 *Screenshot: GitHub Actions run – green test job.*
+File `.github/workflows/ci-cd.yml`, job **test**: checkout → Python 3.12 → install dependencies → pytest. Runs on every push and pull request; a failing test blocks the deploy job.
 
-### 8.7 Google Cloud Deployment
-One-time setup: `scripts/gcp-setup.sh` (enables APIs, creates the registry, creates the deploy service account and key). The first deployment (and all later ones) is done by the pipeline using `google-github-actions/deploy-cloudrun`, with `--allow-unauthenticated` so the app is reachable publicly.
+*Real issue caught by CI:* the first run failed (exit code 2) because plain `pytest` could not import `app` from the `tests` folder, although it worked locally with `python -m pytest`. Fixed by adding `pytest.ini` (`pythonpath = .`); the next run passed.
+> 📸 *Screenshot: failed run, then the green run.*
 
-GitHub repository secrets required: `GCP_PROJECT_ID`, `GCP_SA_KEY`.
-> 📸 *Screenshot: Cloud Run service page (URL, revision, region) and the app open in the browser.*
+### 8.7 Cloud Deployment (Render)
+1. Render Dashboard → **New → Web Service → Existing image**.
+2. Image URL: `ghcr.io/honeycake2601/hospital-mgmt:latest`; Instance type **Free**; Name `hms-app`.
+3. Settings → **Health Check Path** = `/health`.
+4. Settings → copy the **Deploy Hook** URL and store it as the GitHub secret `RENDER_DEPLOY_HOOK`.
+> 📸 *Screenshot: Render service page (URL, status Live, image) and the app in the browser.*
 
 ### 8.8 Continuous Delivery
-On every push to `main`, after tests pass, the **deploy** job automatically: authenticates to GCP → builds the image → pushes it to Artifact Registry → deploys a new Cloud Run revision. Cloud Run only routes traffic to the new revision after it passes its startup check, and old revisions are retained so rollback is a one-click operation.
-> 📸 *Screenshot: full pipeline (test → deploy) green, and Cloud Run "Revisions" tab.*
+On every push to `main`, after tests pass, the **deploy** job builds and pushes the image to GHCR and then calls the Render deploy hook. Render pulls the new image, starts it, waits for `/health` to pass and only then switches traffic, so a broken release does not replace a working one. Previous deploys remain in Render's history for rollback.
+> 📸 *Screenshot: pipeline (test → deploy green) and Render "Events/Deploys" list.*
 
 ## 9. Monitoring and SRE Practices
 
-### 9.1 Google Cloud Logging
-The app writes JSON logs to stdout; Cloud Run forwards them to Cloud Logging. Each request is logged (`GET /api/patients -> 200 (3.2 ms)`), and errors are logged with severity `ERROR`.
-Useful query (Logs Explorer):
-```
-resource.type="cloud_run_revision" AND resource.labels.service_name="hms-app" AND severity>=ERROR
-```
-> 📸 *Screenshot: Logs Explorer with request logs and an ERROR entry.*
+### 9.1 Logging
+The app writes JSON logs to stdout, and Render shows them in the service's **Logs** tab. Each request is logged (`GET /api/patients -> 200 (3.2 ms)`), and errors are logged with severity `ERROR`.
+> 📸 *Screenshot: Render Logs with request lines and an ERROR entry.*
 
-### 9.2 Google Cloud Monitoring
-- **Cloud Run built-in metrics** dashboard: request count, latency, container instance count, 5xx rate.
-- **Uptime check** on `/health` every 1 minute (created by `scripts/monitoring-setup.sh`).
-- **Log-based metric** `hms_app_errors` counting ERROR logs.
-> 📸 *Screenshot: Cloud Run Metrics tab; Uptime check status.*
+### 9.2 Monitoring
+- **Render Metrics tab:** CPU, memory, HTTP request counts and latency.
+- **UptimeRobot:** HTTP(s) monitor on `https://<url>/health` (free plan: checks every 5 minutes) with email alerts on downtime.
+> 📸 *Screenshot: Render Metrics; UptimeRobot dashboard.*
 
 ### 9.3 Two SRE practices implemented
-1. **Health checking + alerting.** `/health` verifies DB connectivity and returns 503 if it fails. An uptime check polls it every minute, and an alert policy (Console → Monitoring → Alerting → Create policy → *Uptime check* `hms-health-check` fails for 2 minutes) emails the team.
-2. **Error detection with SLO thinking.** The log-based metric `hms_app_errors` has an alert (threshold: > 3 errors in 5 minutes). We also defined a simple SLO: **99% of requests succeed (non-5xx) over 30 days** (error budget = 1%), observed via the Cloud Run request-count metric split by response-code class.
-
-*(Optional third: Cloud Run `--max-instances=2` limits blast radius/cost; revisions allow instant rollback.)*
-> 📸 *Screenshot: alert policies list; the log-based metric chart.*
+1. **Health checking and alerting.** `/health` verifies database connectivity and returns 503 on failure. Render uses it for deploy health checks and automatic restart; UptimeRobot polls it externally and emails the team when it fails.
+2. **Error detection with an SLO.** Errors are logged at `ERROR` severity and searchable in Render Logs. A simple SLO is defined: **99% of requests succeed (non-5xx) over 30 days** (error budget 1%), observed from the Metrics tab and UptimeRobot uptime percentage.
+> 📸 *Screenshot: UptimeRobot alert contact and monitor; Render health check setting.*
 
 ### 9.4 How health/reliability was observed
-Through the uptime-check dashboard (availability %, latency), Cloud Run metrics (5xx ratio, request latency), and Logs Explorer (error details). Generate traffic with:
+Through the UptimeRobot uptime % and response times, Render's metrics (latency, HTTP status), and Render Logs (error details). Generate traffic with:
 ```bash
-for i in $(seq 1 50); do curl -s https://<URL>/api/stats > /dev/null; done
+curl https://<url>/api/stats
 ```
 
 ## 10. Failure and Recovery
-**Scenario:** a bad configuration is deployed that points the database to an unwritable path.
+**Scenario:** a bad configuration points the database to an unwritable path.
 
 | Stage | What happened |
 |---|---|
-| **Failure** | Deployed a revision with env var `DB_PATH=/nonexistent/hospital.db`:<br>`gcloud run services update hms-app --region asia-south1 --set-env-vars DB_PATH=/nonexistent/hospital.db`<br>The container starts, but every API call returns **500** and `/health` returns **503**. |
-| **Detection** | The uptime check `hms-health-check` failed and the alert policy sent an email; the `hms_app_errors` alert also fired. |
-| **Diagnosis** | Logs Explorer (`severity>=ERROR`) showed `Health check failed: OperationalError('unable to open database file')` → configuration problem, not a code bug. Cloud Run → Revisions showed the new env var on the latest revision. |
-| **Fix** | Restored the correct configuration (remove the bad variable):<br>`gcloud run services update hms-app --region asia-south1 --remove-env-vars DB_PATH`<br>(Alternative: route 100% traffic back to the previous revision from the Revisions tab.) |
-| **Redeployment** | Cloud Run created a new healthy revision; for a code-level fix, a `git commit` + `git push` triggers the pipeline automatically. |
-| **Recovery** | `/health` returned 200, the uptime check turned green, the alert auto-closed; error logs stopped. Total downtime ≈ X minutes (fill in from the incident timeline). |
+| **Failure** | In Render → Environment, added `DB_PATH=/nonexistent/hospital.db` and saved. The service restarted; every API call returned **500** and `/health` returned **503**. |
+| **Detection** | UptimeRobot marked the monitor **Down** and emailed an alert. |
+| **Diagnosis** | Render Logs showed `Health check failed: OperationalError('unable to open database file')` → a configuration problem, not a code bug. The Environment tab showed the bad variable. |
+| **Fix** | Deleted the `DB_PATH` variable (or rolled back to the previous deploy from the Events tab). |
+| **Redeployment** | Render redeployed automatically. For a code-level fix, a `git commit` + `git push` triggers the full pipeline. |
+| **Recovery** | `/health` returned 200 again, UptimeRobot showed **Up**, error logs stopped. Downtime ≈ X minutes (fill in from the UptimeRobot log). |
 
-> 📸 *Screenshots: (1) 503 response, (2) alert email/incident, (3) error log, (4) fix command, (5) uptime check recovered.*
+> 📸 *Screenshots: (1) 503 on /health, (2) UptimeRobot Down alert, (3) error log, (4) removing the variable, (5) monitor back Up.*
 
 ## 11. Results
-- A working hospital management web app deployed on Cloud Run with a public HTTPS URL.
-- 7/7 automated tests passing in CI.
-- Fully automated pipeline: push → test → build → registry → deploy (≈ 3–5 minutes).
-- Immutable, SHA-tagged images in Artifact Registry enabling rollback.
-- Logs, metrics, uptime check and alerts operational; one failure injected, detected, diagnosed and recovered.
+- A working hospital management web app deployed on Render with a public HTTPS URL.
+- 7/7 automated tests passing in CI; CI caught and helped fix a real import-path issue.
+- Fully automated pipeline: push → test → build → registry → deploy.
+- Immutable, SHA-tagged images in GHCR enabling rollback.
+- Logs, metrics, health checks and alerting operational; one failure injected, detected, diagnosed and recovered.
 
-**Limitations / future work:** persistent database (Cloud SQL), authentication/roles, Workload Identity Federation instead of a service-account key, staging environment, Terraform for infrastructure.
+**Limitations / future work:** persistent managed database, authentication/roles, staging environment, infrastructure-as-code, and a cloud-native stack (e.g., Google Cloud Run + Artifact Registry + Cloud Monitoring) when a paid or credit-backed account is available.
 
 ## 12. Conclusion
-The project shows an end-to-end DevOps workflow on GCP for a simple application and illustrates how automation and observability shorten the time to detect and recover from failures.
+The project demonstrates an end-to-end DevOps workflow for a simple application and shows how automation and observability shorten the time to detect and recover from failures.
 
 ## Appendix A – Execution Instructions
-1. **Clone & run locally**
-   ```bash
-   git clone https://github.com/<user>/hospital-mgmt && cd hospital-mgmt
-   pip install -r requirements.txt && pytest && python app.py
-   ```
-2. **GCP setup (Cloud Shell):** edit `PROJECT_ID` in `scripts/gcp-setup.sh`, then `bash scripts/gcp-setup.sh`.
-3. **GitHub secrets:** add `GCP_PROJECT_ID` and `GCP_SA_KEY` (contents of `key.json`; then delete the key file).
-4. **Deploy:** `git push origin main` → watch the *Actions* tab → open the Cloud Run URL.
-5. **Monitoring:** edit and run `scripts/monitoring-setup.sh`, then create the two alert policies (section 9.3).
-6. **Failure demo:** follow section 10.
+1. `git clone https://github.com/honeycake2601/hospital-mgmt && cd hospital-mgmt`
+2. `pip install -r requirements.txt && pytest && python app.py`
+3. Push to `main` → GitHub Actions builds and pushes the image to GHCR.
+4. Set the GHCR package to Public; create the Render web service from the image; add `RENDER_DEPLOY_HOOK` as a GitHub secret.
+5. Add the UptimeRobot monitor on `/health`.
+6. Run the failure demo from section 10.
 
 ## Appendix B – Repository Structure
 ```
 hospital-mgmt/
 ├── app.py
 ├── requirements.txt
+├── pytest.ini
 ├── Dockerfile
 ├── tests/test_app.py
 ├── .github/workflows/ci-cd.yml
-├── scripts/gcp-setup.sh
-├── scripts/monitoring-setup.sh
 └── REPORT.md
 ```
